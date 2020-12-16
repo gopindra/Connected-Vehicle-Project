@@ -58,7 +58,8 @@ SET tod = CASE
 			WHEN local_day_hour < 12.0 THEN 'Midday 1'
 			WHEN local_day_hour < 15.0 THEN 'Midday 2'
 			WHEN local_day_hour < 19.0 THEN 'PM Peak'
-			ELSE NULL;
+			ELSE NULL
+		  END;
 
 /* Add day of week column */
 ALTER TABLE driver_data
@@ -109,13 +110,17 @@ CREATE TABLE trip_data AS
 	ORDER BY 
 		s.device_id, s.local_time;
 
-/* Checking if journey start and end are as you would expect */
+/* Adding an identity column to the table */
+ALTER TABLE trip_data ADD COLUMN id SERIAL PRIMARY KEY;
+
+/*
+-- Checking if journey start and end are as you would expect 
 SELECT start_journey_event, end_journey_event, count(*) AS freq
 FROM trip_data
 GROUP BY start_journey_event, end_journey_event;
-
 -- START -> END 1294622
 -- START -> START 11624
+*/
 
 /* Removing START -> START cases */
 DELETE FROM trip_data
@@ -129,17 +134,124 @@ DROP COLUMN end_journey_event;
 ALTER TABLE trip_data
 ADD COLUMN next_start_loc_geom geometry(Point, 4326),
 ADD COLUMN next_bg_id varchar,
-ADD COLUMN next_start_time timestamp,
-ADD COLUMN overnight_stay boolean;
+ADD COLUMN next_start_time timestamp;
+
+/* Creating columns for stay_indicator (next start BG same as end BG), stay_duration, overnight_stay (3 am included in stay duration) */
+ALTER TABLE trip_data
+ADD COLUMN stay_indicator boolean,
+ADD COLUMN stay_duration interval;
 
 WITH cte AS (
-	SELECT LEAD(start_loc_geom, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_start_loc_geom,
+	SELECT id,
+		   LEAD(start_loc_geom, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_start_loc_geom,
 	       LEAD(start_bg_id, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_bg_id,
 	       LEAD(start_time, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_start_time
     FROM trip_data
-    )
+)
 UPDATE trip_data
 SET next_start_loc_geom = cte.next_start_loc_geom,
 	next_bg_id = cte.next_bg_id,
 	next_start_time = cte.next_start_time
-FROM cte;
+FROM cte
+WHERE cte.id = trip_data.id;
+
+UPDATE trip_data
+SET stay_indicator = next_start_loc_geom = end_loc_geom;
+
+UPDATE trip_data
+SET stay_duration = next_start_time - end_time;
+
+/* 
+--Unfortunately there seems to be cases with negative stay duration. 
+SELECT stay_duration > '0 second'::interval as valid_stay, count(*)
+FROM trip_data
+GROUP BY valid_stay;
+
+--These appear to be cases where overlapping trips were recorded multiple times. 
+-- Lazy implementation because id may not be consecutive after deletions
+WITH sel_ids AS (
+	SELECT id
+	FROM trip_data
+	WHERE stay_duration < '0 second'::interval
+)
+SELECT * 
+FROM trip_data
+WHERE id IN (SELECT id FROM sel_ids) OR 
+	  id IN (SELECT id-1 FROM sel_ids) OR
+	  id IN (SELECT id+1 FROM sel_ids)
+ORDER BY id
+LIMIT 1000;
+*/
+
+/* Removing negative stay cases */
+DELETE FROM trip_data
+WHERE stay_duration < '0 second'::interval;
+
+/* Recompute lagging columns */
+WITH cte AS (
+	SELECT id,
+		   LEAD(start_loc_geom, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_start_loc_geom,
+	       LEAD(start_bg_id, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_bg_id,
+	       LEAD(start_time, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_start_time
+    FROM trip_data
+)
+UPDATE trip_data
+SET next_start_loc_geom = cte.next_start_loc_geom,
+	next_bg_id = cte.next_bg_id,
+	next_start_time = cte.next_start_time
+FROM cte
+WHERE cte.id = trip_data.id;
+
+UPDATE trip_data
+SET stay_indicator = next_start_loc_geom = end_loc_geom;
+
+UPDATE trip_data
+SET stay_duration = next_start_time - end_time;
+
+
+
+
+
+NOW THERE SHOULD BE NO NEGATIVE STAY duration
+CHECK!
+
+
+
+
+
+/* Function to compute seconds from midnight */
+CREATE OR REPLACE FUNCTION seconds_from_midnight(t timestamp)
+ RETURNS int AS
+$$
+BEGIN
+	RETURN (extract(second from t) +
+			extract(minute from t) * 60 +
+		 	extract(hour from t) * 60 * 60)::int;
+END;
+$$
+LANGUAGE plpgsql;
+
+/*Function to find next 3:00 AM timestamp that occursat or after the input time stamp */
+CREATE OR REPLACE FUNCTION get_day_end(t timestamp)
+	RETURNS timestamp AS
+$$
+DECLARE sec_from_mn int; day_end_time timestamp;
+BEGIN
+	SELECT seconds_from_midnight(t) INTO sec_from_mn;
+	SELECT
+		CASE
+		WHEN sec_from_mn <= 3*60*60
+			THEN DATE(t) + '3:00'::interval
+		WHEN sec_from_mn > 3*60*60
+			THEN DATE(t) + '1 day 3:00'::interval
+		ELSE NULL
+		END
+	INTO day_end_time;
+	RETURN day_end_time;
+END;
+$$ LANGUAGE plpgsql;
+
+UPDATE trip_data
+SET overnight_stay = CASE WHEN stay_indicator 
+						  THEN next_start_time > get_day_end(end_time)
+				     ELSE NULL END;
