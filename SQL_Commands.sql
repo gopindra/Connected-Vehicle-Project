@@ -99,36 +99,86 @@ CREATE TABLE trip_data AS
 		s.local_time as start_time, e.local_time as end_time,
 		e.local_time - s.local_time as travel_time,
 		s.tod, s.day_of_week, s.device_id,
-		s.journey_id,
-		s.journey_event as start_journey_event, e.journey_event as end_journey_event
+		s.journey_id
 	FROM journey_data as s, journey_data as e
 	WHERE 
 		s.device_id = e.device_id AND
 		s.journey_id = e.journey_id AND
 		s.journey_event = 'START' AND
+		e.journey_event = 'END' AND
 		s.local_time < e.local_time
 	ORDER BY 
 		s.device_id, s.local_time;
 
-/* Adding an identity column to the table */
-ALTER TABLE trip_data ADD COLUMN id SERIAL PRIMARY KEY;
+/* Are there only two entries for every journey ID? */
+SELECT 
+	CASE 
+	WHEN COUNT(DISTINCT journey_id) = COUNT(*) THEN 'journey IDs are DISTINCT'
+	ELSE 'journey IDs are not DISTINCT'
+	END
+FROM trip_data;
 
-/*
--- Checking if journey start and end are as you would expect 
-SELECT start_journey_event, end_journey_event, count(*) AS freq
+/* Show journey IDs that occur multiple times */
+SELECT *
 FROM trip_data
-GROUP BY start_journey_event, end_journey_event;
--- START -> END 1294622
--- START -> START 11624
-*/
+WHERE journey_id IN (
+	SELECT journey_id 
+	FROM trip_data
+	GROUP BY journey_id
+	HAVING COUNT(*) > 1
+)
+ORDER BY journey_id, start_time;
+-- 17875 rows selected
+-- Many of these journeys occur over overlapping time periods.
+-- No easy way to select a time period
 
-/* Removing START -> START cases */
+/* Heuristic: Only select journeys with travel times closest to half an hour. */
+/* There is probably a better way to do this */
+CREATE TABLE trip_data2 AS
+	WITH cte AS (
+		SELECT journey_id, MIN(greatest(travel_time - '30 minutes'::interval, '30 minutes'::interval - travel_time)) AS opt_interval_diff
+		FROM trip_data
+		GROUP BY journey_id
+	)
+	SELECT DISTINCT ON (trip_data.journey_id) trip_data.*
+	FROM trip_data
+		INNER JOIN cte
+		ON trip_data.journey_id = cte.journey_id AND
+			greatest(trip_data.travel_time - '30 minutes'::interval, '30 minutes'::interval - trip_data.travel_time) = cte.opt_interval_diff
+	ORDER BY trip_data.journey_id, trip_data.start_time;
+
+DROP TABLE trip_data;
+ALTER TABLE trip_data2 RENAME TO trip_data;
+
+/* Now every row should have distinct journey IDs */
+ALTER TABLE trip_data ADD PRIMARY KEY (journey_id);
+
+/* Deleting duplicate trips with different journey_id */
+WITH count_table AS (
+	SELECT journey_id, ROW_NUMBER() OVER(PARTITION BY device_id, start_loc_geom, end_loc_geom, start_time, end_time ORDER BY journey_id) AS num
+	FROM trip_data
+)
 DELETE FROM trip_data
-WHERE end_journey_event = 'START';
+WHERE journey_id IN (
+		SELECT journey_id 
+		FROM count_table
+		WHERE num > 1
+	);
 
-ALTER TABLE trip_data
-DROP COLUMN start_journey_event, 
-DROP COLUMN end_journey_event;
+/* Heuristic: Deleting rows with same start time but different ending times - keep rows with travel_time closest to 30 min */
+WITH cte AS (
+	SELECT *, ROW_NUMBER() OVER(
+		PARTITION BY device_id, start_time
+		ORDER BY GREATEST(travel_time - '30 minutes'::interval, '30 minutes'::interval - travel_time)) AS tt_rank
+	    -- So rows with tt_rank = 1 will have lowest absolute difference between travel_time and 30 min
+    FROM trip_data
+)
+DELETE FROM trip_data
+WHERE journey_id IN (
+	SELECT journey_id
+	FROM cte
+	WHERE tt_rank > 1
+);
 
 /* Creating variables for determining base location of vehicles */
 ALTER TABLE trip_data
@@ -136,13 +186,13 @@ ADD COLUMN next_start_loc_geom geometry(Point, 4326),
 ADD COLUMN next_bg_id varchar,
 ADD COLUMN next_start_time timestamp;
 
-/* Creating columns for stay_indicator (next start BG same as end BG), stay_duration, overnight_stay (3 am included in stay duration) */
+/* Creating columns for stay_indicator (next start BG same as end BG), stay_duration */
 ALTER TABLE trip_data
 ADD COLUMN stay_indicator boolean,
 ADD COLUMN stay_duration interval;
 
 WITH cte AS (
-	SELECT id,
+	SELECT journey_id,
 		   LEAD(start_loc_geom, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_start_loc_geom,
 	       LEAD(start_bg_id, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_bg_id,
 	       LEAD(start_time, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_start_time
@@ -153,70 +203,67 @@ SET next_start_loc_geom = cte.next_start_loc_geom,
 	next_bg_id = cte.next_bg_id,
 	next_start_time = cte.next_start_time
 FROM cte
-WHERE cte.id = trip_data.id;
+WHERE cte.journey_id = trip_data.journey_id;
 
 UPDATE trip_data
-SET stay_indicator = next_start_loc_geom = end_loc_geom;
+SET stay_indicator = end_bg_id = next_bg_id;
 
 UPDATE trip_data
 SET stay_duration = next_start_time - end_time;
 
-/* 
---Unfortunately there seems to be cases with negative stay duration. 
-SELECT stay_duration > '0 second'::interval as valid_stay, count(*)
-FROM trip_data
-GROUP BY valid_stay;
+/* Check cases with negative stay duration */
+SELECT * FROM trip_data
+WHERE stay_duration < '0 second'::interval;
+-- 223 cases
 
---These appear to be cases where overlapping trips were recorded multiple times. 
--- Lazy implementation because id may not be consecutive after deletions
-WITH sel_ids AS (
-	SELECT id
+/* Debug: View negative stay duration cases
+----------------
+WITH cte AS (
+	SELECT ROW_NUMBER() OVER(ORDER BY device_id, start_time) AS num, *
 	FROM trip_data
-	WHERE stay_duration < '0 second'::interval
+),
+problem_rows AS (
+	SELECT num
+	FROM cte
+	WHERE stay_duration < '0 seconds'::interval
 )
-SELECT * 
-FROM trip_data
-WHERE id IN (SELECT id FROM sel_ids) OR 
-	  id IN (SELECT id-1 FROM sel_ids) OR
-	  id IN (SELECT id+1 FROM sel_ids)
-ORDER BY id
-LIMIT 1000;
+SELECT *
+FROM cte 
+WHERE num IN (SELECT problem_rows.num FROM problem_rows) OR
+	  num+1 IN (SELECT problem_rows.num FROM problem_rows) OR
+	  num+2 IN (SELECT problem_rows.num FROM problem_rows) OR
+	  num-1 IN (SELECT problem_rows.num FROM problem_rows) OR
+	  num-2 IN (SELECT problem_rows.num FROM problem_rows) 
+ORDER BY device_id, start_time;
+-----------------
+There seems to be no easy logic to fix these cases.
+I will leave them as such.
 */
 
-/* Removing negative stay cases */
-DELETE FROM trip_data
-WHERE stay_duration < '0 second'::interval;
-
-/* Recompute lagging columns */
-WITH cte AS (
-	SELECT id,
-		   LEAD(start_loc_geom, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_start_loc_geom,
-	       LEAD(start_bg_id, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_bg_id,
-	       LEAD(start_time, 1) OVER(PARTITION BY device_id ORDER BY start_time) AS next_start_time
-    FROM trip_data
-)
+/* The stay indicators where stay duration is greater than 15 days are invalid because it must have occurred in a different month */
 UPDATE trip_data
-SET next_start_loc_geom = cte.next_start_loc_geom,
-	next_bg_id = cte.next_bg_id,
-	next_start_time = cte.next_start_time
-FROM cte
-WHERE cte.id = trip_data.id;
+SET stay_indicator = CASE WHEN stay_duration < '15 days'::interval THEN stay_indicator ELSE NULL END;
 
+/* Debug: Count cases with different stay indicators 
+SELECT stay_indicator, count(*)
+FROM trip_data
+GROUP BY stay_indicator;
+*/
+
+/* Setting stay_duration to NULL if stay_indicator is false or NULL or if stay_duration is negative */
 UPDATE trip_data
-SET stay_indicator = next_start_loc_geom = end_loc_geom;
+SET stay_duration = CASE 
+		WHEN stay_duration < '15 days'::interval AND stay_duration >= '0 seconds'::interval THEN 
+			CASE 
+				WHEN stay_indicator THEN stay_duration
+				ELSE NULL -- stay_indicator is FALSE or NULL
+			END
+    	ELSE NULL 
+	END;
 
-UPDATE trip_data
-SET stay_duration = next_start_time - end_time;
-
-
-
-
-
-NOW THERE SHOULD BE NO NEGATIVE STAY duration
-CHECK!
-
-
-
+/* Creating column for overnight_stay (stay period covers 3 AM in the morning) */
+ALTER TABLE trip_data
+ADD COLUMN overnight_stay boolean,
 
 
 /* Function to compute seconds from midnight */
