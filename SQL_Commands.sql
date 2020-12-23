@@ -263,8 +263,7 @@ SET stay_duration = CASE
 
 /* Creating column for overnight_stay (stay period covers 3 AM in the morning) */
 ALTER TABLE trip_data
-ADD COLUMN overnight_stay boolean,
-
+ADD COLUMN overnight_stay boolean;
 
 /* Function to compute seconds from midnight */
 CREATE OR REPLACE FUNCTION seconds_from_midnight(t timestamp)
@@ -278,7 +277,7 @@ END;
 $$
 LANGUAGE plpgsql;
 
-/*Function to find next 3:00 AM timestamp that occursat or after the input time stamp */
+/*Function to find next 3:00 AM timestamp that occurs at or after the input time stamp */
 CREATE OR REPLACE FUNCTION get_day_end(t timestamp)
 	RETURNS timestamp AS
 $$
@@ -299,6 +298,41 @@ END;
 $$ LANGUAGE plpgsql;
 
 UPDATE trip_data
-SET overnight_stay = CASE WHEN stay_indicator 
+SET overnight_stay = CASE WHEN stay_indicator AND stay_duration IS NOT NULL
 						  THEN next_start_time > get_day_end(end_time)
 				     ELSE NULL END;
+
+/* Generate a table with the vehicles in the database */
+/* Table has columns showing which block group the vehicle has spent maximum time at overall and on time periods containing 3 AM */
+WITH tot_stay_cte AS (
+	SELECT 
+		device_id, 
+		next_bg_id, SUM(stay_duration) AS stay_duration, 
+		ROW_NUMBER() OVER(PARTITION BY device_id ORDER BY SUM(stay_duration) DESC) AS duration_rank
+	FROM trip_data
+	WHERE stay_duration IS NOT NULL
+	GROUP BY device_id, next_bg_id
+),
+night_stay_cte AS (
+	SELECT 
+		device_id, 
+		next_bg_id, SUM(stay_duration) AS stay_duration, 
+		ROW_NUMBER() OVER(PARTITION BY device_id ORDER BY SUM(stay_duration) DESC) AS duration_rank
+	FROM trip_data
+	WHERE stay_duration IS NOT NULL AND overnight_stay
+	GROUP BY device_id, next_bg_id
+)
+SELECT 
+	t.device_id,
+	t.stay_duration AS tot_stay_duration,
+	t.next_bg_id AS tot_stay_bg_id,
+	n.stay_duration AS night_stay_duration,
+	n.next_bg_id AS night_stay_bg_id
+FROM 
+	tot_stay_cte AS t, 
+	night_stay_cte AS n
+WHERE 
+	t.device_id = n.device_id AND
+	t.duration_rank = 1 AND
+	n.duration_rank = 1
+LIMIT 1000;
